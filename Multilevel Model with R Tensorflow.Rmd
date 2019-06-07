@@ -703,4 +703,3 @@ plot_traces(samples, 49)
 ```
 
 
-
