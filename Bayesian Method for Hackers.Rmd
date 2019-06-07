@@ -1,0 +1,43 @@
+---
+title: "Hackers Book"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(rethinking)
+library(tensorflow)
+library(ggplot2)
+library(tfprobability)
+library(tidyverse)
+library(gridExtra) #for grid.arrange function
+library(keras) #need keras or else will not run
+
+
+
+#tfp distributions
+tfd <- tfp$distributions
+
+#tensorflow eager
+tf$compat$v1$enable_eager_execution()
+```
+
+## Chapter 1: Example1: Coin-flip example
+```{r}
+# prior
+rv_coin_flip_prior = tfd$Bernoulli(probs = 0.5, dtype = tf$int32)
+
+num_trials = c(1L, 2L, 3L, 4L, 5L, 8L, 15L, 50L, 500L, 1000L, 2000L)
+
+# get the 2000 flips data
+coin_flip_data = rv_coin_flip_prior$sample(num_trials[11])
+
+zero = tf$constant(0L, shape = 1)
+coin_flip_data = tf$concat(list(zero, coin_flip_data), axis = -1L)
+
+cumulative_headcounts = tf$gather(tf$cumsum(coin_flip_data), num_trials)
+
+
+```
+
