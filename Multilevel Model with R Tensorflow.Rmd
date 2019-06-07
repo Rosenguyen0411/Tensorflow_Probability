@@ -1,0 +1,706 @@
+---
+title: "Hierachical Model with Tensorflow"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+devtools::install_github("rstudio/tfprobability") #to download tensorflow probability
+#tensorflow::install_tensorflow(version = "nightly")
+
+library(rethinking)
+library(tensorflow)
+library(ggplot2)
+library(tfprobability)
+library(tidyverse)
+library(gridExtra) #for grid.arrange function
+library(keras) #need keras or else will not run
+
+library(zeallot)
+library(abind)
+library(HDInterval)
+library(ellipse)
+
+#tensorflow eager
+tf$compat$v1$enable_eager_execution()
+tf$compat$v1$enable_v2_behavior()
+```
+
+
+###Get the data
+```{r}
+data("reedfrogs")
+d <- reedfrogs
+str(d)
+n_tadpoles = nrow(d)
+n_surviving = d$surv
+n_start = d$density
+```
+
+#####Unpooling Model
+###Specifying model
+```{r}
+m1 <- tfprobability::tfd_joint_distribution_sequential(
+  model = list(
+    # normal prior
+    tfd_multivariate_normal_diag(
+      loc = rep(0, n_tadpoles),
+      scale_identity_multiplier = 5),
+    
+    #binomial likelihood
+    function(l)
+      tfd_independent(
+        tfd_binomial(total_count = n_start, logits = l),
+        reinterpreted_batch_ndims = 1
+      )
+    )
+  )
+
+##sampling example
+m1 %>% tfd_sample(4)
+```
+
+###Define HMC kernel
+```{r}
+# number of steps to run burnin
+n_burnin <- 500
+
+logprob <- function(l)
+  m1 %>% tfd_log_prob(list(l, n_surviving))
+
+hmc <- mcmc_hamiltonian_monte_carlo(
+  target_log_prob_fn = logprob,
+  num_leapfrog_steps = 3,
+  step_size = 0.1,
+) %>%
+  mcmc_simple_step_size_adaptation(
+    target_accept_prob = 0.8,
+    num_adaptation_steps = n_burnin
+  )
+
+```
+
+##Run HMC
+```{r}
+# number of steps after burnin
+n_steps <- 500
+
+# number of chains
+n_chain <- 4
+
+# get starting values for the parameters
+# their shape implicitly determines the number of chains we will run
+c(initial_logits, .) %<-% (m1 %>% tfd_sample(n_chain))
+
+# tell TFP to keep track of acceptance ratio and step size
+trace_fn <- function(state, pkr) {
+  list(pkr$inner_results$is_accepted,
+       pkr$inner_results$accepted_results$step_size)
+}
+
+results <- hmc %>% mcmc_sample_chain(
+  num_results = n_steps,
+  num_burnin_steps = n_burnin,
+  current_state = initial_logits,
+  trace_fn = trace_fn
+)
+
+```
+
+
+##Access result
+```{r}
+mcmc_trace <- results$all_states
+mcmc_trace
+
+# get effective sample size
+ess <- mcmc_effective_sample_size(mcmc_trace) %>% tf$reduce_mean(axis = 0L)
+
+# get rhat
+rhat <- mcmc_potential_scale_reduction(mcmc_trace)
+```
+
+###Run the chains
+```{r}
+sess <- tf$Session()
+eval <- function(...) sess$run(list(...))
+
+c(mcmc_trace) %<-% eval(mcmc_trace)
+
+#result
+#each column is 1 chain
+#each matrix is 1 alpha for 1 tank
+mcmc_trace[,,2]
+```
+
+
+
+
+
+###### Multilevel model or Partially pooled
+# Defining the model
+```{r}
+m2 <- tfd_joint_distribution_sequential(
+  list(
+    # a_bar, the prior for the mean of the normal distribution per-tank logits
+    tfd_normal(loc = 0, scale = 5),
+    
+    # sigma, the prior for the standard deviation of normal distribution per-tank logits
+    tfd_half_cauchy(loc = 0, scale = 1),
+    
+    #normal distribution of per-tank logits
+    # a_bar and sigma refer to the outputs of the two distributions above
+    
+    # the order of the 2 distributions matters. Go from the nearest to the farthest
+    function(sigma, a_bar)
+    tfd_sample_distribution(
+      tfd_normal(loc = a_bar, scale = sigma),
+      sample_shape = list(n_tadpoles)
+    ),
+    
+    # binomial distribution of survival counts
+    # parameter l refers to the output of the normal distribution immediately above
+    
+    function(l)
+      tfd_independent(
+        tfd_binomial(total_count = n_start, logits = l),
+        reinterpreted_batch_ndims = 1
+      )
+  )
+)
+
+# sampling example
+s <- m2 %>% tfd_sample(2)
+
+# log prob example
+m2 %>% tfd_log_prob(s)
+```
+
+# Defining HMC
+```{r}
+n_burnin = 500
+
+# the joint log probability now is based on three parameters
+logprob <- function(a, s, l)
+  m2 %>% tfd_log_prob(list(a, s, l, n_surviving))
+
+hmc <- mcmc_hamiltonian_monte_carlo(
+  target_log_prob_fn = logprob,
+  num_leapfrog_steps = 3,
+  
+  # one step size for each parameter
+  step_size = list(0.1, 0.1, 0.1),
+) %>%
+  mcmc_simple_step_size_adaptation(
+    target_accept_prob = 0.8,
+    num_adaptation_steps = n_burnin)
+
+```
+
+# Run the kernel
+```{r}
+n_chain <- 4
+
+n_steps <- 500
+
+# initial values for 3 parameters
+c(initial_a, initial_s, initial_logits, .) %<-% (m2 %>% tfd_sample(n_chain))
+
+# tell TFP to keep track of acceptance ratio and step size
+trace_fn <- function(state, pkr) {
+  list(pkr$inner_results$is_accepted,
+       pkr$inner_results$accepted_results$step_size)
+}
+
+run_mcmc <- function(kernel) {
+  kernel %>% mcmc_sample_chain(
+    num_results = n_steps,
+    num_burnin_steps = n_burnin,
+    
+    #tf$ones_like create a tensor with all element equal to 1
+    current_state = list(initial_a, tf$ones_like(initial_s), initial_logits),
+    
+    trace_fn = trace_fn
+  )
+}
+```
+
+## Access results
+```{r}
+results <- hmc %>% run_mcmc()
+
+#samples
+mcmc_trace <- results$all_states
+# 500 samples for each chain for each parameters
+mcmc_trace
+
+#diagnostics: acceptance ratio and step size
+diagnostics <- results$trace
+
+# effective sample size
+ess <- mcmc_effective_sample_size(mcmc_trace)
+
+# rhat
+rhat <- mcmc_potential_scale_reduction(mcmc_trace)
+```
+
+###Run the chains
+```{r}
+sess <- tf$Session()
+eval <- function(...) sess$run(list(...))
+
+c(mcmc_trace, diagnostics, ess, rhat) %<-% eval(mcmc_trace, diagnostics, ess, rhat)
+
+# mcmc is  a list of 3
+str(mcmc_trace)
+
+# Access samples of a_bar
+mcmc_trace[[1]]
+
+# diagnostics
+is_accepted <- diagnostics[1]
+step_size <- diagnostics[2]
+
+# effective size
+ess
+
+# rhat
+rhat
+
+```
+
+## Visualize the results
+```{r}
+# trace plot
+a_bar <- mcmc_trace[[1]] %>% as.matrix()
+sigma <- mcmc_trace[[2]] %>% as.matrix()
+
+#the varying alpha for tank 1
+a_1 <- mcmc_trace[[3]][,,1] %>% as.matrix()
+
+# trace plot for a_bar
+prep_tibble <- function(samples) {
+  as_tibble(samples, .name_repair = ~ c("chain_1", "chain_2", "chain_3", "chain_4")) %>%
+  add_column(sample = 1:500) %>%
+  gather(key = "chain", value = "value", -sample)
+}
+
+prep_tibble(a_bar)
+
+plot_trace <- function(samples, param_name) {
+  prep_tibble(samples) %>%
+    ggplot(aes(x = sample, y = value, color = chain)) +
+    geom_line() +
+    ggtitle(param_name)
+}
+
+plot_trace(a_bar, "a_bar")
+plot_trace(sigma, "sigma")
+plot_trace(a_1, "a_1")
+```
+
+## Posterior Distributions
+```{r}
+plot_posterior <- function(samples) {
+  prep_tibble(samples) %>% 
+    ggplot(aes(x = value, color = chain)) +
+    geom_density() +
+    theme_classic() +
+    theme(legend.position = "none",
+          axis.title = element_blank(),
+          axis.text = element_blank(),
+          axis.ticks = element_blank())
+    
+}
+
+plot_posteriors <- function(sample_array, num_params) {
+  plots <- purrr::map(1:num_params, ~ plot_posterior(sample_array[ , , .x] %>% as.matrix()))
+  do.call(grid.arrange, plots)
+}
+
+plot_posteriors(mcmc_trace[[3]], dim(mcmc_trace[[3]])[3])
+```
+
+## Posterior means and HPDIs
+```{r}
+all_samples <- all_samples %>%
+  as_tibble(.name_repair = ~ c("a_bar", "sigma", paste0("a_", 1:48))) 
+
+means <- all_samples %>% 
+  summarise_all(list (~ mean)) %>% 
+  gather(key = "key", value = "mean")
+
+sds <- all_samples %>% 
+  summarise_all(list (~ sd)) %>% 
+  gather(key = "key", value = "sd")
+
+hpdis <-
+  all_samples %>%
+  summarise_all(list(~ list(hdi(.) %>% t() %>% as_tibble()))) %>% 
+  unnest() 
+
+hpdis_lower <- hpdis %>% select(-contains("upper")) %>%
+  rename(lower0 = lower) %>%
+  gather(key = "key", value = "lower") %>% 
+  arrange(as.integer(str_sub(key, 6))) %>%
+  mutate(key = c("a_bar", "sigma", paste0("a_", 1:48)))
+
+hpdis_upper <- hpdis %>% select(-contains("lower")) %>%
+  rename(upper0 = upper) %>%
+  gather(key = "key", value = "upper") %>% 
+  arrange(as.integer(str_sub(key, 6))) %>%
+  mutate(key = c("a_bar", "sigma", paste0("a_", 1:48)))
+
+summary <- means %>% 
+  inner_join(sds, by = "key") %>% 
+  inner_join(hpdis_lower, by = "key") %>%
+  inner_join(hpdis_upper, by = "key")
+
+
+summary %>% 
+  filter(!key %in% c("a_bar", "sigma")) %>%
+  mutate(key_fct = factor(key, levels = unique(key))) %>%
+  ggplot(aes(x = key_fct, y = mean, ymin = lower, ymax = upper)) +
+   geom_pointrange() + 
+   coord_flip() +  
+   xlab("") + ylab("post. mean and HPDI") +
+   theme_minimal()
+```
+
+## Comprehensive summary
+```{r}
+is_accepted <- is_accepted %>% as.integer() %>% mean()
+step_size <- purrr::map(step_size, mean)
+
+ess <- apply(ess, 2, mean)
+
+summary_with_diag <- summary %>% add_column(ess = ess, rhat = rhat)
+summary_with_diag
+```
+
+## Posterior survival probabilities
+```{r}
+sim_tanks <- rnorm(8000, a_bar, sigma)
+tibble(x = sim_tanks) %>% ggplot(aes(x = x)) + geom_density() + xlab("distribution of per-tank logits")
+
+# our usual sigmoid by another name (undo the logit)
+logistic <- function(x) 1/(1 + exp(-x))
+probs <- map_dbl(sim_tanks, logistic)
+tibble(x = probs) %>% ggplot(aes(x = x)) + geom_density() + xlab("probability of survival")
+```
+
+# Shrinkage
+```{r}
+summary %>% 
+  filter(!key %in% c("a_bar", "sigma")) %>%
+  select(key, mean) %>%
+  mutate(est_survival = logistic(mean)) %>%
+  add_column(act_survival = d$propsurv) %>%
+  select(-mean) %>%
+  gather(key = "type", value = "value", -key) %>%
+  ggplot(aes(x = key, y = value, color = type)) +
+  geom_point() +
+  geom_hline(yintercept = mean(d$propsurv), size = 0.5, color = "cyan" ) +
+  xlab("") +
+  ylab("") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank())
+```
+
+
+
+
+
+
+
+
+###### Varying Slopes/ Partial Pooled. Cafe Model
+```{r}
+# Prepare the data
+
+# average morning wait time
+a <- 3.5
+# average difference afternoon wait time
+# we wait less in the afternoons
+b <- -1
+# standard deviation in the (café-specific) intercepts
+sigma_a <- 1
+# standard deviation in the (café-specific) slopes
+sigma_b <- 0.5
+# correlation between intercepts and slopes
+# the higher the intercept, the more the wait goes down
+rho <- -0.7
+
+
+##### Generate the covariance matrix #####
+
+# means of intercepts and slopes
+mu <- c(a, b)
+# standard deviations of means and slopes
+sigmas <- c(sigma_a, sigma_b) 
+# correlation matrix
+# a correlation matrix has ones on the diagonal and the correlation in the off-diagonals
+rho <- matrix(c(1, rho, rho, 1), nrow = 2) 
+# now matrix multiply to get covariance matrix
+cov_matrix <- diag(sigmas) %*% rho %*% diag(sigmas)
+
+##### Generate the café-specific intercepts and slopes #####
+
+# 20 cafés overall
+n_cafes <- 20
+
+library(MASS)
+set.seed(5) # used to replicate example
+# multivariate distribution of intercepts and slopes
+vary_effects <- mvrnorm(n_cafes , mu ,cov_matrix)
+# intercepts are in the first column
+a_cafe <- vary_effects[ ,1]
+# slopes are in the second
+b_cafe <- vary_effects[ ,2]
+
+
+##### Generate the actual wait times #####
+
+set.seed(22)
+# 10 visits per café
+n_visits <- 10
+
+# alternate values for mornings and afternoons in the data frame
+afternoon <- rep(0:1, n_visits * n_cafes/2)
+# data for each café are consecutive rows in the data frame
+cafe_id <- rep(1:n_cafes, each = n_visits)
+
+# the regression equation for the mean waiting time
+mu <- a_cafe[cafe_id] + b_cafe[cafe_id] * afternoon
+# standard deviation of waiting time within cafés
+sigma <- 0.5 # std dev within cafes
+# generate instances of waiting times
+wait <- rnorm(n_visits * n_cafes, mu, sigma)
+
+d <- data.frame(cafe = cafe_id, afternoon = afternoon, wait = wait)
+
+```
+
+## Define the model
+```{r}
+model <- function(cafe_id) {
+  tfd_joint_distribution_sequential(
+    list(
+      
+      # rho, the prior for the correlation matrix between intercepts and slopes
+      tfd_lkj(2, 2, input_output_cholesky = TRUE), #event_shape = [2,2]
+      
+      # sigma, prior variance for the waiting time
+      tfd_sample_distribution(tfd_exponential(1), sample_shape = 1),
+      
+      # sigma_cafe, prior of variances for intercepts and slopes (vector of 2)
+      tfd_sample_distribution(tfd_exponential(1), sample_shape = 2),
+      
+      # b, the prior mean for the slopes
+      tfd_sample_distribution(tfd_normal(loc = -1, scale = 5), sample_shape = 1),
+      
+      # a, the prior mean for the intercepts
+      tfd_sample_distribution(tfd_normal(loc = 5, scale = 2), sample_shape = 1),
+      
+      # mvn, multivariate distribution of intercepts and slopes
+        # shape: batch size: 20, event shape: 2 => 20x1x2
+      function(a, b, sigma_cafe, sigma, chol_rho)
+        tfd_sample_distribution(
+          tfd_multivariate_normal_tri_l(
+            loc = tf$concat(list(a,b), axis = -1L),
+            scale_tril = tf$linalg$LinearOperatorDiag(sigma_cafe)$matmul(chol_rho)),
+          sample_shape = n_cafes),
+      
+      # waiting time
+        # shape should be batch size: 200
+      function(mvn, a, b, sigma_cafe, sigma)
+        tfd_independent(
+          # need to pull out the correct cafe_id in the middle column
+          tfd_normal(
+            loc = (tf$gather(mvn[,,1], cafe_id, axis = -1L) + 
+                     tf$gather(mvn[,,2], cafe_id, axis = -1L) * afternoon),
+            scale = sigma), # Shape [batch,  1]
+          
+          reinterpreted_batch_ndims = 1
+          )
+    )
+  )
+}
+
+# quick check on the model
+n_cafes <- 20
+
+# why change id to 0-19 instead of 1-20?? perhaps something with tf$gather? gather works from [0, 20) 
+cafe_id <- tf$cast((d$cafe - 1) %% 20, tf$int64)
+
+afternoon <- d$afternoon
+wait <- d$wait
+
+# sample from the model
+m <- model(cafe_id)
+s <- m %>% tfd_sample(3)
+m %>% tfd_log_prob(s)
+```
+
+### Define HMC 
+```{r}
+# Specify bijectors
+constraining_bijectors <- list(
+  # make sure the rho[1:4] parameters are valid for a Cholesky factor
+  tfb_correlation_cholesky(),
+  
+  # make sure variance is positive
+  tfb_exp(),
+  
+  # make sure variance is positive
+  tfb_exp(),
+  
+  # leave the normal distribution as is
+  tfb_identity(),
+  tfb_identity(),
+  tfb_identity()
+)
+
+# set up HMC
+n_steps <- 500
+n_burnin <- 500
+n_chains <- 4
+
+# set up the optimization objective
+logprob <- function(rho, sigma, sigma_cafe, b, a, mvn) {
+   m %>% tfd_log_prob(list(rho, sigma, sigma_cafe, b, a, mvn, wait))
+}
+ 
+
+# initial states for the sampling procedure
+c(initial_rho, initial_sigma, initial_sigma_cafe, initial_b, initial_a, initial_mvn, .) %<-% (m %>% tfd_sample(n_chains))
+
+# HMC sampler, with the above bijectors and step size adaptation
+hmc <- mcmc_hamiltonian_monte_carlo(
+  target_log_prob_fn = logprob,
+  num_leapfrog_steps = 3,
+  step_size = list(0.1, 0.1, 0.1, 0.1, 0.1, 0.1)
+) %>% 
+  mcmc_transformed_transition_kernel(bijector = constraining_bijectors) %>%
+  mcmc_simple_step_size_adaptation(target_accept_prob = 0.8,
+                                   num_adaptation_steps = n_burnin)
+
+# keep track of step sizes and acceptance rates
+trace_fn <- function(state, pkr) {
+  list(pkr$inner_results$inner_results$is_accepted,
+       pkr$inner_results$inner_results$accepted_results$step_size)
+}
+```
+
+## Run kernel
+```{r}
+run_mcmc <- function(kernel) {
+  kernel %>% mcmc_sample_chain(
+    num_results = n_steps,
+    num_burnin_steps = n_burnin,
+    current_state = list(initial_rho,
+                         tf$ones_like(initial_sigma),
+                         tf$ones_like(initial_sigma_cafe),
+                         initial_b,
+                         initial_a,
+                         initial_mvn),
+    trace_fn = trace_fn
+  )
+}
+
+results <- hmc %>% run_mcmc()  
+
+# results
+mcmc_trace <- results$all_states #shape = (500, 4, 20, 2)
+
+```
+
+### Results
+# we want shape (500, 4, 49)
+```{r}
+# for the trace plots, we want to have them in shape (500, 4, 49)
+# that is: (number of steps, number of chains, number of parameters)
+samples <- abind(
+  # rho 1:4
+  as.array(mcmc_trace[[1]] %>% tf$reshape(list(tf$cast(n_steps, tf$int32), tf$cast(n_chains, tf$int32), 4L))),
+  # sigma
+  as.array(mcmc_trace[[2]]),  
+  # sigma_cafe 1:2
+  as.array(mcmc_trace[[3]][ , , 1]),    
+  as.array(mcmc_trace[[3]][ , , 2]), 
+  # b
+  as.array(mcmc_trace[[4]]),  
+  # a
+  as.array(mcmc_trace[[5]]),  
+  # mvn 10:49
+  as.array( mcmc_trace[[6]] %>% tf$reshape(list(tf$cast(n_steps, tf$int32), tf$cast(n_chains, tf$int32), 40L))),
+  along = 3) 
+
+# the effective sample sizes
+# we want them in shape (4, 49), which is (number of chains * number of parameters)
+ess <- mcmc_effective_sample_size(mcmc_trace) 
+ess <- cbind(
+  # rho 1:4
+  as.matrix(ess[[1]] %>% tf$reshape(list(tf$cast(n_chains, tf$int32), 4L))),
+  # sigma
+  as.matrix(ess[[2]]),  
+  # sigma_cafe 1:2
+  as.matrix(ess[[3]][ , 1, drop = FALSE]),    
+  as.matrix(ess[[3]][ , 2, drop = FALSE]), 
+  # b
+  as.matrix(ess[[4]]),  
+  # a
+  as.matrix(ess[[5]]),  
+  # mvn 10:49
+  as.matrix(ess[[6]] %>% tf$reshape(list(tf$cast(n_chains, tf$int32), 40L)))
+  ) 
+
+# the rhat values
+# we want them in shape (49), which is (number of parameters)
+rhat <- mcmc_potential_scale_reduction(mcmc_trace)
+rhat <- c(
+  # rho 1:4
+  as.double(rhat[[1]] %>% tf$reshape(list(4L))),
+  # sigma
+  as.double(rhat[[2]]),  
+  # sigma_cafe 1:2
+  as.double(rhat[[3]][1]),    
+  as.double(rhat[[3]][2]), 
+  # b
+  as.double(rhat[[4]]),  
+  # a
+  as.double(rhat[[5]]),  
+  # mvn 10:49
+  as.double(rhat[[6]] %>% tf$reshape(list(40L)))
+  )
+```
+
+## Trace Plots
+```{r}
+prep_tibble <- function(samples) {
+  as_tibble(samples, .name_repair = ~ c("chain_1", "chain_2", "chain_3", "chain_4")) %>% 
+    add_column(sample = 1:n_steps) %>%
+    gather(key = "chain", value = "value", -sample)
+}
+
+plot_trace <- function(samples) {
+  prep_tibble(samples) %>% 
+    ggplot(aes(x = sample, y = value, color = chain)) +
+    geom_line() + 
+    theme_light() +
+    theme(legend.position = "none",
+          axis.title = element_blank(),
+          axis.text = element_blank(),
+          axis.ticks = element_blank())
+}
+
+plot_traces <- function(sample_array, num_params) {
+  plots <- purrr::map(1:num_params, ~ plot_trace(sample_array[ , , .x]))
+  do.call(grid.arrange, plots)
+}
+
+plot_traces(samples, 49)
+```
+
+
+
