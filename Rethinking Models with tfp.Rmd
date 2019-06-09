@@ -1,0 +1,275 @@
+---
+title: "Rethinking Models with tfp"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#devtools::install_github("rstudio/tfprobability") #to download tensorflow probability
+#tensorflow::install_tensorflow(version = "nightly")
+
+library(rethinking)
+library(tensorflow)
+library(ggplot2)
+library(tfprobability)
+library(tidyverse)
+library(keras) #need keras or else will not run
+
+#tensorflow eager
+tf$compat$v1$enable_eager_execution()
+```
+
+
+
+###### Chapter5: Milk model
+## First Model: m5.6 Simple bivariate regression between kilocalories and neocortex percent
+```{r}
+# Data
+library(rethinking)
+data(milk)
+d <- as_tibble(milk)
+d$K <- scale( d$kcal.per.g)
+d$N <- scale( d$neocortex.perc )
+d$M <- scale(log(d$mass))
+
+# only keep non-missing case
+d <- d[ complete.cases(d$K,d$N,d$M) , ]
+
+K <- as.vector(d$K)
+N <- as.vector(d$N)
+M <- as.vector(d$M)
+
+id = 1:nrow(d)
+n_samples = nrow(d)
+
+###Specifying model
+m1 <- tfd_joint_distribution_sequential(
+  model = list(
+    
+    # sigma, prior for std of kcal
+   tfd_sample_distribution(tfd_exponential(1), sample_shape = 1),
+   
+    # b, prior for slope
+    tfd_sample_distribution(tfd_normal(loc = 0, scale = 0.5), sample_shape = 1),
+    
+    # a, prior for intercept
+   tfd_sample_distribution(tfd_normal(loc = 0, scale = 0.2), sample_shape = 1),
+  
+    # likelihood for kcal
+   # need to get [event_shape = 17]
+    function(a, b, sigma) {
+      #mu = tf$squeeze(a + b *N)
+      tfd_independent(tfd_multivariate_normal_diag(
+          loc = a + b *N, 
+          scale_identity_multiplier = sigma),
+        reinterpreted_batch_ndims = 1
+      )
+    }
+  )
+)
+
+# sampling example
+m1 %>% tfd_sample(1)
+m1 %>% tfd_sample(4)
+
+###Define HMC kernel
+n_steps <- 1000
+n_burnin <- 500
+n_chains <- 4
+
+# target logprob
+logprob1 <- function(sigma, b, a) {
+  m1 %>% tfd_log_prob(list(sigma, b, a, K))
+}
+
+# initial states for the sampling procedure
+c(initial_sigma, initial_b, initial_a, .) %<-% (m1 %>% tfd_sample(n_chains))
+
+hmc1 <- mcmc_hamiltonian_monte_carlo(
+  target_log_prob_fn = logprob1,
+  num_leapfrog_steps = 3,
+  step_size = c(0.1, 0.1, 0.1)
+) %>%
+  mcmc_simple_step_size_adaptation(target_accept_prob = 0.8,
+                                   num_adaptation_steps = n_burnin)
+
+# keep track of step sizes and acceptance rates
+trace_fn1 <- function(state, pkr) {
+  list(pkr$inner_results$is_accepted,
+       pkr$inner_results$accepted_results$step_size)
+}
+
+# Run kernel
+run_mcmc1 <- function(kernel) {
+  kernel %>% mcmc_sample_chain(
+    num_results = n_steps,
+    num_burnin_steps = n_burnin,
+    current_state = list(tf$ones_like(initial_sigma),
+                         initial_b,
+                         initial_a),
+    trace_fn = trace_fn1
+  )
+}
+
+results1 <- hmc1 %>% run_mcmc1
+
+# 1000 samples for each chain (4 chains) for each parameters, list of 3 parameters
+mcmc_trace1 <- results1$all_states
+str(mcmc_trace1)
+
+sigma1 <- as.array(mcmc_trace1[[1]] %>% tf$reshape(list(1000L, 4L)))
+b1 <- as.array(mcmc_trace1[[2]] %>% tf$reshape(list(1000L, 4L)))
+a1 <- as.array(mcmc_trace1[[3]] %>% tf$reshape(list(1000L, 4L)))
+
+mean(sigma1)
+mean(b1)
+mean(a1)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Fourth Model: m5.9 Simple bivariate regression between kilocalories and neocortex percent
+```{r}
+data(milk)
+d <- milk
+unique(d$clade)
+d$clade_id <- as.integer( d$clade )
+n_clade <- length(unique(d$clade))
+d$K <- scale( d$kcal.per.g )
+K <- as.vector(d$K)
+
+
+###Specifying model
+model <- function(cafe_id) {
+ tfd_joint_distribution_sequential(
+  model = list(
+    
+    # sigma, prior for std of kcal
+   tfd_sample_distribution(tfd_exponential(1), sample_shape = 1),
+   
+    # alpha, prior for mu
+    tfd_sample_distribution(tfd_normal(loc = 0, scale = 0.5), sample_shape = n_clade),
+    
+  
+    # likelihood for kcal
+   # need to get [event_shape = 17]
+    function(alpha, sigma) {
+      #mu = tf$squeeze(a + b *N)
+      tfd_independent(
+        tfd_normal(
+          loc = tf$gather(alpha, cafe_id, axis = -1L),
+          scale = sigma),
+        reinterpreted_batch_ndims = 1
+      )
+    }
+  )
+)
+}
+
+clade_id <- tf$cast((d$clade_id - 1) %% 4, tf$int64)
+m4 <- model(clade_id)
+
+m4 %>% tfd_sample(4) 
+
+## define HMC
+n_steps <- 1000
+n_burnin <- 500
+n_chains <- 4
+
+# target logprob
+logprob4 <- function(sigma, alpha) {
+  m4 %>% tfd_log_prob(list(sigma, alpha, K))
+}
+
+# initial states for the sampling procedure
+c(initial_sigma, initial_alpha, .) %<-% (m4 %>% tfd_sample(n_chains))
+
+hmc4 <- mcmc_hamiltonian_monte_carlo(
+  target_log_prob_fn = logprob4,
+  num_leapfrog_steps = 3,
+  step_size = c(0.1, 0.1)
+) %>%
+  mcmc_simple_step_size_adaptation(target_accept_prob = 0.8,
+                                   num_adaptation_steps = n_burnin)
+
+# keep track of step sizes and acceptance rates
+trace_fn4 <- function(state, pkr) {
+  list(pkr$inner_results$is_accepted,
+       pkr$inner_results$accepted_results$step_size)
+}
+
+# Run kernel
+run_mcmc4 <- function(kernel) {
+  kernel %>% mcmc_sample_chain(
+    num_results = n_steps,
+    num_burnin_steps = n_burnin,
+    current_state = list(tf$ones_like(initial_sigma),
+                         initial_alpha),
+    trace_fn = trace_fn4
+  )
+}
+
+results4 <- hmc4 %>% run_mcmc4
+
+# 1000 samples for each chain (4 chains) for each parameters, list of 2 parameters
+mcmc_trace4 <- results4$all_states
+
+
+#diagnostics: acceptance ratio and step size
+diagnostics4 <- results4$trace
+is_accepted4 <- diagnostics4[1]
+step_size4 <- diagnostics4[2]
+
+
+# effective sample size
+ess4 <- mcmc_effective_sample_size(mcmc_trace4)
+# rhat
+rhat4 <- mcmc_potential_scale_reduction(mcmc_trace4)
+
+## Visualize the results
+# trace plot
+sigma4 <- as.array(mcmc_trace4[[1]] %>% tf$reshape(list(1000L, 4L)))
+str(sigma4)
+alpha_clade1 <- mcmc_trace4[[2]][,,1]%>% as.matrix()
+alpha_clade2 <- mcmc_trace4[[2]][,,2] %>% as.matrix()
+alpha_clade3 <- mcmc_trace4[[2]][,,3] %>% as.matrix()
+alpha_clade4 <- mcmc_trace4[[2]][,,4] %>% as.matrix()
+
+prep_tibble <- function(samples) {
+  as_tibble(samples, .name_repair = ~ c("chain_1", "chain_2", "chain_3", "chain_4")) %>%
+  add_column(sample = 1:n_steps) %>%
+  gather(key = "chain", value = "value", -sample)
+}
+
+plot_trace <- function(samples) {
+  prep_tibble(samples) %>% 
+    ggplot(aes(x = sample, y = value, color = chain)) +
+    geom_line() + 
+    theme_light() +
+    theme(legend.position = "none",
+          axis.title = element_blank(),
+          axis.text = element_blank(),
+          axis.ticks = element_blank())
+}
+
+plot_trace(sigma4)
+plot_trace(alpha_clade1)
+
+## Posterior means and HPDIs
+alpha_clade_tb1 = prep_tibble(alpha_clade3)
+mean(alpha_clade_tb1$value)
+```
+
