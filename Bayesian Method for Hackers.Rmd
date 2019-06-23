@@ -17,7 +17,7 @@ library(keras) #need keras or else will not run
 
 
 #tfp distributions
-tfd <- tfp$distributions
+#tfd <- tfp$distributions
 
 #tensorflow eager
 tf$compat$v1$enable_eager_execution()
@@ -39,5 +39,1011 @@ coin_flip_data = tf$concat(list(zero, coin_flip_data), axis = -1L)
 cumulative_headcounts = tf$gather(tf$cumsum(coin_flip_data), num_trials)
 
 
+```
+
+
+
+### TOO BIG STD, WEIRD RESULTS
+## Chapter 1: 1.4.1 Inferring behavior from text-message Data
+```{r}
+# Data
+count_data = c(13,  24,   8,  24,   7,  35,  14,  11,  15,  11,  22,  22,  11,  57,  11,  19,  29,   6,  19,  12,  22,  12,  18,  72,  32,   9,   7,  13,  19,  23,  27,  20,   6,  17,  13,  10,  14,   6,  16,  15,   7,   2,  15,  15,  19,  70,  49,   7,  53,  22,  21,  31,  19,  11,  18,  20,  12,  35,  17,  23,  17,   4,   2,  31,  30,  13,  27,   0,  39,  37, 5,  14,  13,  22)
+
+alpha = 1 / mean(count_data)
+n_days <- tf$cast(length(count_data), tf$float32)
+days <- 1:length(count_data)
+days_id <- tf$cast(tf$range(n_days), tf$float32)
+
+
+###Specifying model
+text_m1 <- tfd_joint_distribution_sequential(
+  model = list(
+    
+    # lambda_1, vector of 2
+    c,
+    
+     # lambda_2
+    #tfd_sample_distribution(tfd_exponential(alpha), sample_shape = 1), 
+  
+    # tau
+    tfd_sample_distribution(tfd_uniform(low = 0, high = 1), sample_shape = 1),
+   
+  
+    # likelihood for text
+   # need to get [event_shape = 100]
+    function(tau, lambda_1) {
+      indices = tf$to_int32(tau * n_days <= days_id)
+      lambda = tf$gather(lambda_1, indices, axis = -1L) 
+      
+      tfd_independent(tfd_poisson(rate = lambda),
+        reinterpreted_batch_ndims = 2
+      )
+    }
+  )
+)
+
+
+# sampling example
+text_m1 %>% tfd_sample(1)
+text_m1 %>% tfd_sample(4)
+
+
+###Define HMC kernel
+n_steps <- 10000
+n_burnin <- 1000
+n_chains <- 4
+
+text_constraining_bijectors <- list(
+  # make sure lambda is positive
+  tfb_exp(),
+  # make sure tau is between [0,1]
+  tfb_sigmoid()
+)
+
+# target logprob
+text_logprob1 <- function(lambda_1, tau) {
+  text_m1 %>% tfd_log_prob(list(lambda_1, tau, count_data))
+}
+
+# initial states for the sampling procedure
+#c(initial_lambda_1, initial_tau, .) %<-% (text_m1 %>% tfd_sample(n_chains))
+
+
+initial_lambda_1 <- tf$constant(rep(19.74324, 8), dtype = tf$float32, shape = c(4,2))
+
+initial_tau <- tf$constant(rep(0.5, 4), dtype = tf$float32, shape = c(4,1))
+
+
+
+text_hmc1 <- mcmc_hamiltonian_monte_carlo(
+  target_log_prob_fn = text_logprob1,
+  num_leapfrog_steps = 10,
+  step_size = c(0.05, 0.05),
+  state_gradients_are_stopped = TRUE
+) %>% 
+  mcmc_transformed_transition_kernel(bijector = text_constraining_bijectors) %>%
+  mcmc_simple_step_size_adaptation(target_accept_prob = 0.7,
+                                   num_adaptation_steps = n_burnin)
+
+
+# keep track of step sizes and acceptance rates
+text_trace_fn1 <- function(state, pkr) {
+  list(pkr$inner_results$inner_results$is_accepted,
+       pkr$inner_results$inner_results$accepted_results$step_size)
+}
+
+
+# Run kernel
+text_run_mcmc1 <- function(kernel) {
+  kernel %>% mcmc_sample_chain(
+    num_results = n_steps,
+    num_burnin_steps = n_burnin,
+    current_state = list(initial_lambda_1,
+                         initial_tau),
+    trace_fn = text_trace_fn1
+  )
+}
+
+text_results1 <- text_hmc1 %>% text_run_mcmc1
+
+# 20000 samples for each chain (4 chains) for each parameters, list of 2 parameters
+text_mcmc_trace1 <- text_results1$all_states
+
+str(text_mcmc_trace1)
+
+text_lambda_1 <- as.array(text_mcmc_trace1[[1]][,,1] %>% tf$reshape(list(10000L, 4L)))
+text_lambda_2 <- as.array(text_mcmc_trace1[[1]][,,2] %>% tf$reshape(list(10000L, 4L)))
+text_tau <- as.array(text_mcmc_trace1[[2]] %>% tf$reshape(list(10000L, 4L)))
+
+## Posterior means and HPDIs
+text_all_samples_1 <- tf$concat(
+    list(
+  text_lambda_1,
+  text_lambda_2,
+  text_tau
+    ),
+    axis = -1L
+  ) %>%
+  tf$reshape(list(40000L, 3L))
+
+prep_tibble <- function(samples) {
+  as_tibble(samples, .name_repair = ~ c("chain_1", "chain_2", "chain_3", "chain_4")) %>%
+  add_column(sample = 1:n_steps) %>%
+  gather(key = "chain", value = "value", -sample)
+}
+
+plot_trace <- function(samples) {
+  prep_tibble(samples) %>% 
+    ggplot(aes(x = sample, y = value, color = chain)) +
+    geom_line() + 
+    theme_light() +
+    theme(legend.position = "none",
+          axis.title = element_blank(),
+          axis.text = element_blank(),
+          axis.ticks = element_blank())
+}
+
+text_all_samples_1 <- text_all_samples_1 %>%
+  as.matrix() %>%
+  as_tibble(.name_repair = ~ c("lambda_1", "lambda_2", "tau")) 
+
+text_means_1 <- text_all_samples_1 %>% 
+  summarise_all(list (~ mean)) %>% 
+  gather(key = "key", value = "mean")
+
+text_sds_1 <- text_all_samples_1 %>% 
+  summarise_all(list (~ sd)) %>% 
+  gather(key = "key", value = "sd")
+
+plot_trace(text_lambda_1)
+plot_trace(text_lambda_2)
+plot_trace(text_tau)
+```
+
+
+##### Chapter 2
+## First Model: A and B together
+```{r}
+#these two quantities are unknown to us.
+true_prob_A = 0.05
+true_prob_B = 0.04
+
+#notice the unequal sample sizes -- no problem in Bayesian analysis.
+N_A = 1500L
+N_B = 750L
+
+#generate some observations
+observations_A = tfd_bernoulli(probs=true_prob_A)$sample(sample_shape=N_A, seed=6.45)
+
+
+observations_B = tfd_bernoulli(probs=true_prob_B)$sample(sample_shape=N_B, seed=6.45)
+
+###Specifying model for A
+Ab_m1_A <- tfd_joint_distribution_sequential(
+  model = list(
+    
+    # prob_A
+    rv_prob_A <- tfd_sample_distribution(tfd_uniform(0, 1), sample_shape = 1),
+    
+    # likelihood A
+     function(rv_prob_A) {
+      tfd_independent(tfd_bernoulli(probs = rv_prob_A),
+        reinterpreted_batch_ndims = 1
+      )
+     }
+  )
+)
+
+
+# sampling example
+Ab_m1_A %>% tfd_sample(1)
+Ab_m1_A %>% tfd_sample(4)
+
+
+###Define HMC kernel
+n_steps <- 10000
+n_burnin <- 1000
+n_chains <- 4
+
+Ab_constraining_bijectors_A <- list(
+  # make sure lambda is positive
+  #tfb_identity(),
+  # make sure tau is between [0,1]
+  tfb_identity()
+)
+
+# target logprob
+Ab_logprob1_A <- function(prob_A) {
+  Ab_m1_A %>% tfd_log_prob(list(prob_A, observations_A))
+}
+
+# initial states for the sampling procedure
+#c(initial_lambda_1, initial_tau, .) %<-% (Ab_m1 %>% tfd_sample(n_chains))
+
+
+initial_prob_A <- tf$constant(rep(0.050666668, 4), dtype = tf$float32, shape = c(4,1))
+
+#initial_prob_B <- tf$constant(rep(0.053333335, 4), dtype = tf$float32, shape = c(4,1))
+
+
+
+Ab_hmc1 <- mcmc_hamiltonian_monte_carlo(
+  target_log_prob_fn = Ab_logprob1_A,
+  num_leapfrog_steps = 3,
+  step_size = c(0.5)
+) %>% 
+  mcmc_transformed_transition_kernel(bijector = Ab_constraining_bijectors_A) %>%
+  mcmc_simple_step_size_adaptation(target_accept_prob = 0.7,
+                                   num_adaptation_steps = n_burnin)
+
+
+# keep track of step sizes and acceptance rates
+Ab_trace_fn1_A <- function(state, pkr) {
+  list(pkr$inner_results$inner_results$is_accepted,
+       pkr$inner_results$inner_results$accepted_results$step_size)
+}
+
+
+# Run kernel
+Ab_run_mcmc1_A <- function(kernel) {
+  kernel %>% mcmc_sample_chain(
+    num_results = n_steps,
+    num_burnin_steps = n_burnin,
+    current_state = list(initial_prob_A),
+    trace_fn = Ab_trace_fn1_A
+  )
+}
+
+Ab_results1_A <- Ab_hmc1_A %>% Ab_run_mcmc1_A
+
+# 20000 samples for each chain (4 chains) for each parameters, list of 2 parameters
+Ab_mcmc_trace1_A <- Ab_results1_A$all_states
+
+str(Ab_mcmc_trace1_A)
+
+Ab_prob_A <- as.array(Ab_mcmc_trace1[[1]] %>% tf$reshape(list(10000L, 4L)))
+Ab_prob_B <- as.array(Ab_mcmc_trace1[[1]] %>% tf$reshape(list(10000L, 4L)))
+
+
+## Posterior means and HPDIs
+Ab_all_samples_1 <- tf$concat(
+    list(
+  Ab_prob_A
+    ),
+    axis = -1L
+  ) %>%
+  tf$reshape(list(40000L, 1L))
+
+Ab_all_samples_1 <- Ab_all_samples_1 %>%
+  as.matrix() %>%
+  as_tibble(.name_repair = ~ c("prob_A")) 
+
+Ab_means_1 <- Ab_all_samples_1 %>% 
+  summarise_all(list (~ mean)) %>% 
+  gather(key = "key", value = "mean")
+
+Ab_sds_1 <- Ab_all_samples_1 %>% 
+  summarise_all(list (~ sd)) %>% 
+  gather(key = "key", value = "sd")
+
+plot_trace(Ab_prob_A)
+
+
+
+
+
+
+###Specifying model for B
+Ab_m1_B <- tfd_joint_distribution_sequential(
+  model = list(
+    
+    # prob_B
+    rv_prob_B <- tfd_sample_distribution(tfd_uniform(0, 1), sample_shape = 1),
+    
+    # likelihood B
+     function(rv_prob_B) {
+      tfd_independent(tfd_bernoulli(probs = rv_prob_B),
+        reinterpreted_batch_ndims = 1
+      )
+     }
+  )
+)
+
+
+# sampling example
+Ab_m1_B %>% tfd_sample(1)
+Ab_m1_B %>% tfd_sample(4)
+
+
+Ab_constraining_bijectors_B <- list(
+  tfb_identity()
+)
+
+# target logprob
+Ab_logprob1_B <- function(prob_B) {
+  Ab_m1_B %>% tfd_log_prob(list(prob_B, observations_B))
+}
+
+# initial states for the sampling procedure
+initial_prob_B <- tf$constant(rep(0.053333335, 4), dtype = tf$float32, shape = c(4,1))
+
+Ab_hmc1_B <- mcmc_hamiltonian_monte_carlo(
+  target_log_prob_fn = Ab_logprob1_B,
+  num_leapfrog_steps = 3,
+  step_size = c(0.5),
+  state_gradients_are_stopped = TRUE
+) %>% 
+  mcmc_transformed_transition_kernel(bijector = Ab_constraining_bijectors_B) %>%
+  mcmc_simple_step_size_adaptation(target_accept_prob = 0.7,
+                                   num_adaptation_steps = n_burnin)
+
+
+# keep track of step sizes and acceptance rates
+Ab_trace_fn1_B <- function(state, pkr) {
+  list(pkr$inner_results$inner_results$is_accepted,
+       pkr$inner_results$inner_results$accepted_results$step_size)
+}
+
+
+# Run kernel
+Ab_run_mcmc1_B <- function(kernel) {
+  kernel %>% mcmc_sample_chain(
+    num_results = n_steps,
+    num_burnin_steps = n_burnin,
+    current_state = list(initial_prob_B),
+    trace_fn = Ab_trace_fn1_B
+  )
+}
+
+Ab_results1_B <- Ab_hmc1_B %>% Ab_run_mcmc1_B
+
+# 20000 samples for each chain (4 chains) for each parameters, list of 2 parameters
+Ab_mcmc_trace1_B <- Ab_results1_B$all_states
+
+str(Ab_mcmc_trace1_B)
+
+Ab_prob_B <- as.array(Ab_mcmc_trace1_B[[1]] %>% tf$reshape(list(10000L, 4L)))
+
+
+## Posterior means and HPDIs
+Ab_all_samples_1_B <- tf$concat(
+    list(
+  Ab_prob_B
+    ),
+    axis = -1L
+  ) %>%
+  tf$reshape(list(40000L, 1L))
+
+Ab_all_samples_1_B <- Ab_all_samples_1_B %>%
+  as.matrix() %>%
+  as_tibble(.name_repair = ~ c("prob_B")) 
+
+Ab_means_1_B <- Ab_all_samples_1_B %>% 
+  summarise_all(list (~ mean)) %>% 
+  gather(key = "key", value = "mean")
+
+Ab_sds_1_B <- Ab_all_samples_1_B %>% 
+  summarise_all(list (~ sd)) %>% 
+  gather(key = "key", value = "sd")
+
+plot_trace(Ab_prob_B)
+
+```
+
+##### WORK!!!
+## Second Model: Cheating among students
+```{r}
+total_count = 100
+total_yes = 35
+
+###Specifying model
+Cheating_m1 <- tfd_joint_distribution_sequential(
+  model = list(
+    
+    # lies_prob
+    rv_lies_prob <- tfd_sample_distribution(tfd_uniform(0, 1), sample_shape = 1),
+    
+    # likelihood A
+     function(rv_lies_prob) {
+       p_skewed = 0.5 * rv_lies_prob + 0.25
+       
+      tfd_independent(tfd_binomial(total_count = total_count, probs = p_skewed),
+        reinterpreted_batch_ndims = 1
+      )
+     }
+  )
+)
+
+
+# sampling example
+Cheating_m1 %>% tfd_sample(1)
+Cheating_m1 %>% tfd_sample(4)
+
+
+###Define HMC kernel
+n_steps <- 10000
+n_burnin <- 1000
+n_chains <- 4
+
+Cheating_constraining_bijectors <- list(
+  tfb_sigmoid() # map [0,1] to R
+)
+
+# target logprob
+Cheating_logprob1 <- function(prob_lies) {
+  Cheating_m1 %>% tfd_log_prob(list(prob_lies, total_yes))
+}
+
+# initial states for the sampling procedure
+#c(initial_lambda_1, initial_tau, .) %<-% (Cheating_m1 %>% tfd_sample(n_chains))
+
+
+initial_prob_lies <- tf$constant(rep(0.2, 4), dtype = tf$float32, shape = c(4,1))
+
+
+
+Cheating_hmc1 <- mcmc_hamiltonian_monte_carlo(
+  target_log_prob_fn = Cheating_logprob1,
+  num_leapfrog_steps = 3,
+  step_size = c(0.5)
+) %>% 
+  mcmc_transformed_transition_kernel(bijector = Cheating_constraining_bijectors) %>%
+  mcmc_simple_step_size_adaptation(target_accept_prob = 0.7,
+                                   num_adaptation_steps = n_burnin)
+
+
+# keep track of step sizes and acceptance rates
+Cheating_trace_fn1 <- function(state, pkr) {
+  list(pkr$inner_results$inner_results$is_accepted,
+       pkr$inner_results$inner_results$accepted_results$step_size)
+}
+
+
+# Run kernel
+Cheating_run_mcmc1 <- function(kernel) {
+  kernel %>% mcmc_sample_chain(
+    num_results = n_steps,
+    num_burnin_steps = n_burnin,
+    current_state = list(
+                         initial_prob_lies),
+    trace_fn = Cheating_trace_fn1
+  )
+}
+
+Cheating_results1 <- Cheating_hmc1 %>% Cheating_run_mcmc1
+
+# 10000 samples for each chain (4 chains) for each parameters, list of 1 parameters
+Cheating_mcmc_trace1 <- Cheating_results1$all_states
+
+str(Cheating_mcmc_trace1)
+
+Cheating_prob_lies <- as.array(Cheating_mcmc_trace1[[1]] %>% tf$reshape(list(10000L, 4L)))
+
+
+## Posterior means and HPDIs
+Cheating_all_samples_1 <- tf$concat(
+    list(
+  Cheating_prob_lies
+    ),
+    axis = -1L
+  ) %>%
+  tf$reshape(list(40000L, 1L))
+
+prep_tibble <- function(samples) {
+  as_tibble(samples, .name_repair = ~ c("chain_1", "chain_2", "chain_3", "chain_4")) %>%
+  add_column(sample = 1:n_steps) %>%
+  gather(key = "chain", value = "value", -sample)
+}
+
+plot_trace <- function(samples) {
+  prep_tibble(samples) %>% 
+    ggplot(aes(x = sample, y = value, color = chain)) +
+    geom_line() + 
+    theme_light() +
+    theme(legend.position = "none",
+          axis.title = element_blank(),
+          axis.text = element_blank(),
+          axis.ticks = element_blank())
+}
+
+Cheating_all_samples_1 <- Cheating_all_samples_1 %>%
+  as.matrix() %>%
+  as_tibble(.name_repair = ~ c("prob_lies")) 
+
+Cheating_means_1 <- Cheating_all_samples_1 %>% 
+  summarise_all(list (~ mean)) %>% 
+  gather(key = "key", value = "mean")
+
+Cheating_sds_1 <- Cheating_all_samples_1 %>% 
+  summarise_all(list (~ sd)) %>% 
+  gather(key = "key", value = "sd")
+
+plot_trace(Cheating_prob_lies)
+plot_trace(Cheating_prob_B)
+```
+
+
+## Big Std, weird results
+### Third Model: Challenger Space Shuttle Disaster
+```{r}
+shuttle_data <- read.csv("https://raw.githubusercontent.com/CamDavidsonPilon/Probabilistic-Programming-and-Bayesian-Methods-for-Hackers/master/Chapter2_MorePyMC/data/challenger_data.csv")
+
+shuttle_data <- shuttle_data[complete.cases(shuttle_data$Damage.Incident),]
+
+temperature <- as.vector(shuttle_data$Temperature)[1:23]
+damage <- as.vector(as.numeric(shuttle_data$Damage.Incident))[1:23] - 1
+
+
+###Specifying model
+Shuttle_m1 <- tfd_joint_distribution_sequential(
+  model = list(
+    
+    # alpha
+    rv_alpha <- tfd_sample_distribution(tfd_normal(0, 1000), sample_shape = 1),
+    
+    # beta
+    rv_beta <- tfd_sample_distribution(tfd_normal(0, 1000), sample_shape = 1),
+    
+    # likelihood A
+     function(rv_beta, rv_alpha) {
+       logistic_p = 1 / (1 + tf$exp(rv_beta * tf$to_float(temperature) + rv_alpha))
+       
+      tfd_independent(tfd_bernoulli(probs = logistic_p),
+        reinterpreted_batch_ndims = 1
+      )
+     }
+  )
+)
+
+
+# sampling example
+Shuttle_m1 %>% tfd_sample(1)
+Shuttle_m1 %>% tfd_sample(4)
+
+
+###Define HMC kernel
+n_steps <- 10000
+n_burnin <- 2000
+n_chains <- 4
+
+Shuttle_constraining_bijectors <- list(
+  tfb_affine_scalar(100),
+  tfb_identity()
+)
+
+# target logprob
+Shuttle_logprob1 <- function(rv_alpha, rv_beta) {
+  Shuttle_m1 %>% tfd_log_prob(list(rv_alpha, rv_beta, damage))
+}
+
+# initial states for the sampling procedure
+initial_alpha <- tf$constant(rep(0, 4), dtype = tf$float32, shape = c(4,1))
+initial_beta <- tf$constant(rep(0, 4), dtype = tf$float32, shape = c(4,1))
+
+
+
+Shuttle_hmc1 <- mcmc_hamiltonian_monte_carlo(
+  target_log_prob_fn = Shuttle_logprob1,
+  num_leapfrog_steps = 10,
+  step_size = c(0.01, 0.01),
+  state_gradients_are_stopped = TRUE
+) %>% 
+  mcmc_transformed_transition_kernel(bijector = Shuttle_constraining_bijectors) %>%
+  mcmc_simple_step_size_adaptation(target_accept_prob = 0.7,
+                                   num_adaptation_steps = n_burnin)
+
+
+# keep track of step sizes and acceptance rates
+Shuttle_trace_fn1 <- function(state, pkr) {
+  list(pkr$inner_results$inner_results$is_accepted,
+       pkr$inner_results$inner_results$accepted_results$step_size)
+}
+
+
+# Run kernel
+Shuttle_run_mcmc1 <- function(kernel) {
+  kernel %>% mcmc_sample_chain(
+    num_results = n_steps,
+    num_burnin_steps = n_burnin,
+    current_state = list(initial_alpha,
+                         initial_beta),
+    trace_fn = Shuttle_trace_fn1
+  )
+}
+
+Shuttle_results1 <- Shuttle_hmc1 %>% Shuttle_run_mcmc1
+
+# 10000 samples for each chain (4 chains) for each parameters, list of 2 parameters
+Shuttle_mcmc_trace1 <- Shuttle_results1$all_states
+
+str(Shuttle_mcmc_trace1)
+
+Shuttle_alpha <- as.array(Shuttle_mcmc_trace1[[1]] %>% tf$reshape(list(10000L, 4L)))
+Shuttle_beta <- as.array(Shuttle_mcmc_trace1[[2]] %>% tf$reshape(list(10000L, 4L)))
+
+
+## Posterior means and HPDIs
+Shuttle_all_samples_1 <- tf$concat(
+    list(
+  Shuttle_alpha,
+  Shuttle_beta
+    ),
+    axis = -1L
+  ) %>%
+  tf$reshape(list(40000L, 2L))
+
+prep_tibble <- function(samples) {
+  as_tibble(samples, .name_repair = ~ c("chain_1", "chain_2", "chain_3", "chain_4")) %>%
+  add_column(sample = 1:n_steps) %>%
+  gather(key = "chain", value = "value", -sample)
+}
+
+plot_trace <- function(samples) {
+  prep_tibble(samples) %>% 
+    ggplot(aes(x = sample, y = value, color = chain)) +
+    geom_line() + 
+    theme_light() +
+    theme(legend.position = "none",
+          axis.title = element_blank(),
+          axis.text = element_blank(),
+          axis.ticks = element_blank())
+}
+
+Shuttle_all_samples_1 <- Shuttle_all_samples_1 %>%
+  as.matrix() %>%
+  as_tibble(.name_repair = ~ c("alpha", "beta")) 
+
+Shuttle_means_1 <- Shuttle_all_samples_1 %>% 
+  summarise_all(list (~ mean)) %>% 
+  gather(key = "key", value = "mean")
+
+Shuttle_sds_1 <- Shuttle_all_samples_1 %>% 
+  summarise_all(list (~ sd)) %>% 
+  gather(key = "key", value = "sd")
+
+plot_trace(Shuttle_alpha)
+plot_trace(Shuttle_beta)
+
+```
+
+
+
+#### INCOMPATIBLE SHAPE
+#### Chapter 3
+## First Model: Unsupervised Clustering using a Mixture Model
+
+```{r}
+mixture_data <- read.csv("https://raw.githubusercontent.com/CamDavidsonPilon/Probabilistic-Programming-and-Bayesian-Methods-for-Hackers/master/Chapter3_MCMC/data/mixture_data.csv", header = FALSE)
+
+
+mixture_data <- as.vector(mixture_data[1:300,])
+
+    # prob
+    rv_prob <- tfd_sample_distribution(tfd_uniform(0, 1), sample_shape = 1), 
+    
+    # stds
+    rv_sds <- tfd_sample_distribution(tfd_uniform(low = c(0, 0), high = c(100, 100)), sample_shape = 1), 
+    
+    # center
+    rv_centers <- tfd_sample_distribution(tfd_normal(loc = c(120,  190), scale = c(10, 10)), sample_shape = 1), 
+
+
+###Specifying model
+mixture_m1 <- tfd_joint_distribution_sequential(
+  model = list(
+    
+    # prob
+    rv_prob <- tfd_uniform(0, 1), 
+    
+    # stds
+    rv_sds <- tfd_uniform(low = c(0, 0), high = c(100, 100)), 
+    
+    # center
+    rv_centers <- tfd_normal(loc = c(120,  190), scale = c(10, 10)), 
+    
+    
+    
+    # likelihood A
+     function(rv_centers, rv_sds, rv_prob) {
+       
+       rv_assignments = tfd_categorical(probs = tf$concat(c(rv_prob, 1 - rv_prob), axis = -1L))
+       
+      tfd_independent(tfd_mixture_same_family(
+        mixture_distribution = rv_assignments, 
+        components_distribution = tfd_normal(
+          loc = rv_centers,
+          scale = rv_sds
+        )
+      ),
+        reinterpreted_batch_ndims = 1
+      )
+     }
+  )
+)
+
+
+
+# sampling example
+mixture_m1 %>% tfd_sample(1)
+mixture_m1 %>% tfd_sample(4)
+
+
+###Define HMC kernel
+n_steps <- 10000
+n_burnin <- 2000
+n_chains <- 4
+
+mixture_constraining_bijectors <- list(
+  tfb_identity(),
+  tfb_identity(),
+  tfb_identity()
+)
+
+# target logprob
+mixture_logprob1 <- function(rv_prob, rv_sds, rv_centers) {
+  mixture_m1 %>% tfd_log_prob(list(rv_prob, rv_sds, rv_centers, mixture_data))
+}
+
+# initial states for the sampling procedure
+initial_prob <- tf$constant(rep(0.5, 4), dtype = tf$float32, shape = c(4,1))
+initial_sds <- tf$constant(rep(c(10, 10), 4), dtype = tf$float32, shape = c(4,2))
+initial_centers <- tf$constant(rep(c(120,190), 4), dtype = tf$float32, shape = c(4,2))
+
+
+
+mixture_hmc1 <- mcmc_hamiltonian_monte_carlo(
+  target_log_prob_fn = mixture_logprob1,
+  num_leapfrog_steps = 2,
+  step_size = c(0.5, 0.5, 0.5),
+  state_gradients_are_stopped = TRUE
+) %>% 
+  mcmc_transformed_transition_kernel(bijector = mixture_constraining_bijectors) %>%
+  mcmc_simple_step_size_adaptation(target_accept_prob = 0.7,
+                                   num_adaptation_steps = n_burnin)
+
+
+# keep track of step sizes and acceptance rates
+mixture_trace_fn1 <- function(state, pkr) {
+  list(pkr$inner_results$inner_results$is_accepted,
+       pkr$inner_results$inner_results$accepted_results$step_size)
+}
+
+
+# Run kernel
+mixture_run_mcmc1 <- function(kernel) {
+  kernel %>% mcmc_sample_chain(
+    num_results = n_steps,
+    num_burnin_steps = n_burnin,
+    current_state = list(initial_prob,
+                         initial_sds,
+                         initial_centers),
+    trace_fn = mixture_trace_fn1
+  )
+}
+
+mixture_results1 <- mixture_hmc1 %>% mixture_run_mcmc1
+
+# 10000 samples for each chain (4 chains) for each parameters, list of 2 parameters
+mixture_mcmc_trace1 <- mixture_results1$all_states
+
+str(mixture_mcmc_trace1)
+
+mixture_prob <- as.array(mixture_mcmc_trace1[[1]] %>% tf$reshape(list(10000L, 4L)))
+
+mixture_sds_1 <- as.array(mixture_mcmc_trace1[[2]][,,1] %>% tf$reshape(list(10000L, 4L)))
+mixture_sds_2 <- as.array(mixture_mcmc_trace1[[2]][,,2] %>% tf$reshape(list(10000L, 4L)))
+
+mixture_centers_1 <- as.array(mixture_mcmc_trace1[[3]][,,1] %>% tf$reshape(list(10000L, 4L)))
+mixture_centers_2 <- as.array(mixture_mcmc_trace1[[3]][,,2] %>% tf$reshape(list(10000L, 4L)))
+
+
+## Posterior means and HPDIs
+mixture_all_samples_1 <- tf$concat(
+    list(
+  mixture_prob,
+  mixture_sds_1,
+  mixture_sds_2,
+  mixture_centers_1,
+  mixture_centers_2
+    ),
+    axis = -1L
+  ) %>%
+  tf$reshape(list(40000L, 5L))
+
+prep_tibble <- function(samples) {
+  as_tibble(samples, .name_repair = ~ c("chain_1", "chain_2", "chain_3", "chain_4")) %>%
+  add_column(sample = 1:n_steps) %>%
+  gather(key = "chain", value = "value", -sample)
+}
+
+plot_trace <- function(samples) {
+  prep_tibble(samples) %>% 
+    ggplot(aes(x = sample, y = value, color = chain)) +
+    geom_line() + 
+    theme_light() +
+    theme(legend.position = "none",
+          axis.title = element_blank(),
+          axis.text = element_blank(),
+          axis.ticks = element_blank())
+}
+
+mixture_all_samples_1 <- mixture_all_samples_1 %>%
+  as.matrix() %>%
+  as_tibble(.name_repair = ~ c("prob", "sds_1", "sds_2", "center_1", "center_2")) 
+
+mixture_means_1 <- mixture_all_samples_1 %>% 
+  summarise_all(list (~ mean)) %>% 
+  gather(key = "key", value = "mean")
+
+mixture_sds_1 <- mixture_all_samples_1 %>% 
+  summarise_all(list (~ sd)) %>% 
+  gather(key = "key", value = "sd")
+
+plot_trace(mixture_prob)
+plot_trace(mixture_sds_1)
+
+```
+
+
+
+
+#### Chapter 4
+## First Model: Kaggle's U.S. Census Return Rate Challenge
+```{r}
+census_data <- read.csv("https://raw.githubusercontent.com/CamDavidsonPilon/Probabilistic-Programming-and-Bayesian-Methods-for-Hackers/master/Chapter4_TheGreatestTheoremNeverTold/data/census_data.csv", header = FALSE)
+
+
+census_data <- as.vector(census_data[1:300,])
+
+###Specifying model
+census_m1 <- tfd_joint_distribution_sequential(
+  model = list(
+    
+    # prob
+    rv_prob <- tfd_uniform(0, 1), 
+    
+    # stds
+    rv_sds <- tfd_uniform(low = c(0, 0), high = c(100, 100)), 
+    
+    # center
+    rv_centers <- tfd_normal(loc = c(120,  190), scale = c(10, 10)), 
+    
+    
+    
+    # likelihood A
+     function(rv_centers, rv_sds, rv_prob) {
+       rv_assignments =  tfd_categorical(probs = tf$squeeze(tf$stack(c(rv_prob, 1 - rv_prob), axis = -1L)))
+       
+      tfd_independent(tfd_census_same_family(
+        census_distribution = rv_assignments, 
+        components_distribution = tfd_normal(
+          loc = rv_centers,
+          scale = rv_sds
+        )
+      ),
+        reinterpreted_batch_ndims = 1
+      )
+     }
+  )
+)
+
+# sampling example
+census_m1 %>% tfd_sample(1)
+census_m1 %>% tfd_sample(4)
+
+
+###Define HMC kernel
+n_steps <- 10000
+n_burnin <- 2000
+n_chains <- 4
+
+census_constraining_bijectors <- list(
+  tfb_identity(),
+  tfb_identity(),
+  tfb_identity()
+)
+
+# target logprob
+census_logprob1 <- function(rv_prob, rv_sds, rv_centers) {
+  census_m1 %>% tfd_log_prob(list(rv_prob, rv_sds, rv_centers, census_data))
+}
+
+# initial states for the sampling procedure
+initial_prob <- tf$constant(rep(0.5, 4), dtype = tf$float32, shape = c(4,1))
+initial_sds <- tf$constant(rep(c(10, 10), 4), dtype = tf$float32, shape = c(4,2))
+initial_centers <- tf$constant(rep(c(120,190), 4), dtype = tf$float32, shape = c(4,2))
+
+
+
+census_hmc1 <- mcmc_hamiltonian_monte_carlo(
+  target_log_prob_fn = census_logprob1,
+  num_leapfrog_steps = 2,
+  step_size = c(0.5, 0.5, 0.5),
+  state_gradients_are_stopped = TRUE
+) %>% 
+  mcmc_transformed_transition_kernel(bijector = census_constraining_bijectors) %>%
+  mcmc_simple_step_size_adaptation(target_accept_prob = 0.7,
+                                   num_adaptation_steps = n_burnin)
+
+
+# keep track of step sizes and acceptance rates
+census_trace_fn1 <- function(state, pkr) {
+  list(pkr$inner_results$inner_results$is_accepted,
+       pkr$inner_results$inner_results$accepted_results$step_size)
+}
+
+
+# Run kernel
+census_run_mcmc1 <- function(kernel) {
+  kernel %>% mcmc_sample_chain(
+    num_results = n_steps,
+    num_burnin_steps = n_burnin,
+    current_state = list(initial_prob,
+                         initial_sds,
+                         initial_centers),
+    trace_fn = census_trace_fn1
+  )
+}
+
+census_results1 <- census_hmc1 %>% census_run_mcmc1
+
+# 10000 samples for each chain (4 chains) for each parameters, list of 2 parameters
+census_mcmc_trace1 <- census_results1$all_states
+
+str(census_mcmc_trace1)
+
+census_prob <- as.array(census_mcmc_trace1[[1]] %>% tf$reshape(list(10000L, 4L)))
+
+census_sds_1 <- as.array(census_mcmc_trace1[[2]][,,1] %>% tf$reshape(list(10000L, 4L)))
+census_sds_2 <- as.array(census_mcmc_trace1[[2]][,,2] %>% tf$reshape(list(10000L, 4L)))
+
+census_centers_1 <- as.array(census_mcmc_trace1[[3]][,,1] %>% tf$reshape(list(10000L, 4L)))
+census_centers_2 <- as.array(census_mcmc_trace1[[3]][,,2] %>% tf$reshape(list(10000L, 4L)))
+
+
+## Posterior means and HPDIs
+census_all_samples_1 <- tf$concat(
+    list(
+  census_prob,
+  census_sds_1,
+  census_sds_2,
+  census_centers_1,
+  census_centers_2
+    ),
+    axis = -1L
+  ) %>%
+  tf$reshape(list(40000L, 5L))
+
+prep_tibble <- function(samples) {
+  as_tibble(samples, .name_repair = ~ c("chain_1", "chain_2", "chain_3", "chain_4")) %>%
+  add_column(sample = 1:n_steps) %>%
+  gather(key = "chain", value = "value", -sample)
+}
+
+plot_trace <- function(samples) {
+  prep_tibble(samples) %>% 
+    ggplot(aes(x = sample, y = value, color = chain)) +
+    geom_line() + 
+    theme_light() +
+    theme(legend.position = "none",
+          axis.title = element_blank(),
+          axis.text = element_blank(),
+          axis.ticks = element_blank())
+}
+
+census_all_samples_1 <- census_all_samples_1 %>%
+  as.matrix() %>%
+  as_tibble(.name_repair = ~ c("prob", "sds_1", "sds_2", "center_1", "center_2")) 
+
+census_means_1 <- census_all_samples_1 %>% 
+  summarise_all(list (~ mean)) %>% 
+  gather(key = "key", value = "mean")
+
+census_sds_1 <- census_all_samples_1 %>% 
+  summarise_all(list (~ sd)) %>% 
+  gather(key = "key", value = "sd")
+
+plot_trace(census_prob)
+plot_trace(census_sds_1)
 ```
 
